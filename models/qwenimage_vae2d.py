@@ -19,6 +19,8 @@ from safetensors.torch import load_file
 
 import comfy.ops
 
+from .attention import bounded_attention
+
 # See models/dinov2.py for why disable_weight_init is the right variant here:
 # identical forward()/state_dict keys to plain torch.nn, just ComfyUI-native.
 ops = comfy.ops.disable_weight_init
@@ -97,10 +99,11 @@ class AttentionBlock2D(nn.Module):
         x = self.norm(x)
         qkv = self.to_qkv(x).reshape(b, 3, c, h * w).permute(0, 1, 3, 2).contiguous()
         q, k, v = qkv.unbind(dim=1)
-        # 4-D (b, 1, N, c) single-head layout selects the O(N)-memory fused
-        # attention kernel; the 3-D (b, N, c) form falls back to O(N^2) math
-        # on some accelerators and OOMs on large tiles.
-        x_attn = F.scaled_dot_product_attention(q[:, None], k[:, None], v[:, None]).squeeze(1)
+        # The 4-D (b, 1, N, c) layout is upstream's, chosen to select a fused O(N)-memory
+        # kernel; models/attention.bounded_attention keeps that shape but computes the
+        # exact math, because on ROCm the fused kernels return a grid-patterned image here
+        # instead of failing.
+        x_attn = bounded_attention(q[:, None], k[:, None], v[:, None]).squeeze(1)
         x_attn = x_attn.permute(0, 2, 1).reshape(b, c, h, w)
         return self.proj(x_attn) + identity
 

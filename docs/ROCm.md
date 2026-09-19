@@ -7,11 +7,17 @@ required to reproduce the reference implementation's numbers.
 
 ## 1. Attention backends
 
-ComfyUI's `main.py` sets `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` on every start. On
-`gfx1103` the ROCm AOTriton kernel images are missing or unsuitable, so **both** the flash
-and the mem-efficient SDPA backends launch and fail. The failure is reported
-asynchronously at the next CUDA call, which is why it surfaces as `hipErrorInvalidValue`
-inside DINOv2's `proj` Linear rather than at the attention itself.
+ComfyUI's `main.py` sets `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` on every start, which
+is what makes the fused SDPA backends selectable at all. On `gfx1103` the kernel images are
+missing or unsuitable, and they fail in **two different ways**:
+
+- **Loudly, asynchronously.** The LightningDiT/DINOv2 shapes launch and fail, but the error
+  is reported at the next CUDA call, which is why it surfaces as `hipErrorInvalidValue`
+  inside DINOv2's `proj` Linear rather than at the attention itself.
+- **Silently.** The VAE mid block's 4-D `(b, 1, N, c)` fp32 call -- which upstream's own
+  comment says is written that way *to select* a fused kernel -- succeeds and returns an
+  image covered in a regular grid. At 1200px that is a thin bright mesh across the whole
+  frame; at 512px it is invisible.
 
 Measured on this box with the stock upstream `inference_vosr_onestep.py`
 (64x64 -> 2x, fp32, seed 42, untiled, `--align_method nofix`):
@@ -21,12 +27,24 @@ Measured on this box with the stock upstream `inference_vosr_onestep.py`
 | stock upstream | unset | OK |
 | stock upstream | `1` (what ComfyUI sets) | `CUDA error: invalid argument` |
 | stock upstream + `SDPBackend.MATH` pin | `1` | OK |
+| stock upstream + MATH pin, VAE mid block still fused | `1` | OK at 512px, **grid at 1200px** |
 
-Pinning to MATH changes the output by at most 1/255, i.e. within this box's run-to-run
-variation. `models/attention.py` applies that pin to the three SDPA call sites (DINOv2 plus
-the two LightningDiT attentions). The fp32 VAE is deliberately left on the default
-backends: its tiles reach ~16k tokens where MATH's O(N^2) attention matrix would be a real
-memory cost, and fp32 does not select the broken kernels.
+The second failure mode, isolated at 150px -> 8x (1200px, tile 512/overlap 128,
+`align=none`, seed 666), mean |diff| against the same run with the env var unset:
+
+| run | mean | 8px-cell spread (lower = no grid) |
+|---|---|---|
+| bare script, env var unset | -- | 56.58 |
+| bare script, env var set, pre-fix | 20.0/255 | 72.53 |
+| ComfyUI process, pre-fix | 20.0/255 | 72.43 |
+| ComfyUI process, after the fix | 0.06/255 | 56.72 |
+
+So no VOSR2 attention may touch a fused SDPA kernel on ROCm. `models/attention.py` pins
+`SDPBackend.MATH` for the small attentions (DINOv2's 1024 tokens, the DiT's 4096-token
+latent tiles) and computes the *same* math with `bounded_attention` for the VAE mid block,
+chunked over the query axis, because a single-shot O(N^2) matrix there is 2 GiB at 1200px
+and 274 GiB at 4096px. Pinning the DiT and DINOv2 attentions changes their output by at most
+1/255, i.e. within this box's run-to-run variation.
 
 ## 2. Matching the reference
 
@@ -87,6 +105,9 @@ The reference harness lives outside this repo, in `E:\ComfyUI_JZ\_vosr_diag`:
 - `micro_probe.py` - the two contract probes above (noise draw, pre-scale kernels).
 - `tiled_check.py` - upstream's `tiled_latent_inference` vs this branch's tiling, at a size
   where the blend grid is real.
+- `repro_1200.py` - the user's 1200px case, run in-process with and without ComfyUI's env
+  var; `submit_repro.js` drives the same prompt through a real ComfyUI instance, which is
+  what isolates the two attention failure modes above.
 
 `outDump\intermediates.pt` (64x64 -> 2x, seed 42, fp32, untiled, `nofix`) is the parity
 target: `lq`, `lq_latent`, `venc_layer17`, `noise`, DiT `u`, `sr_latent`, `sr_tensor`, final

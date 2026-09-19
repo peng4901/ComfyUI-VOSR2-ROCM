@@ -188,7 +188,7 @@ Prefer an existing local ComfyUI/torch blur operation. Otherwise add a small sep
 - Keep tensor code device-neutral for CPU, ROCm, XPU, and other supported devices where operations work.
 - Give DiT, VAE, and DINOv2 ComfyUI-compatible loading/offload wrappers so only the active phase must be resident.
 - Load checkpoint tensors on the offload device and avoid duplicate GPU copies.
-- Adapt DiT attention to ComfyUI optimized attention rather than choosing a private backend.
+- Adapt DiT attention to ComfyUI optimized attention rather than choosing a private backend. Where ComfyUI's selection is unavailable or unsafe on the running platform (see `docs/ROCm.md`: on gfx1103 the fused ROCm kernels either die asynchronously or silently grid-pattern the VAE mid block), `models/attention.py` is the single place that decides, and every SDPA call in the package goes through it.
 - Use existing ComfyUI/Comfy Kitchen operations when their exact math/layout contract matches.
 - Do not add `torch.no_grad()` or `torch.inference_mode()`; ComfyUI owns inference policy.
 - Do not synchronize CUDA or call `torch.cuda.empty_cache()` from the node.
