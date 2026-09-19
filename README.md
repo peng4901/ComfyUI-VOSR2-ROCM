@@ -1,319 +1,176 @@
-# ComfyUI-VOSR2
+# ComfyUI-VOSR2-ROCM
 
-ComfyUI nodes for **VOSR 2.0** — the one-step, 1.4B-parameter image
-super-resolution model (LightningDiT + Qwen-Image 2D VAE + DINOv2-L
-conditioning). This is a standalone community package; it is **not** part of the
-upstream [`cswry/VOSR`](https://github.com/cswry/VOSR) repository.
+An AMD ROCm build of the [ComfyUI-VOSR2](https://github.com/ylchen333/ComfyUI-VOSR2) node for
+**VOSR 2.0** — one-step, 1.4B image super-resolution (LightningDiT + Qwen-Image 2D VAE +
+DINOv2-L).
 
-- Upstream code: <https://github.com/cswry/VOSR>
-- Upstream weights: <https://huggingface.co/CSWRY/VOSR>
-- This node package: <https://github.com/ylchen333/ComfyUI-VOSR2>
+Upstream is developed and CI-tested on CPU and CUDA. On ROCm the node did not work out of the
+box: it crashed inside the vision encoder, and once running it produced a regular grid pattern
+over the upscaled image. This fork fixes both, and reproduces the upstream reference
+implementation to within this hardware's 1/255 run-to-run noise floor.
 
+- Upstream node: <https://github.com/ylchen333/ComfyUI-VOSR2>
+- Official VOSR code: <https://github.com/cswry/VOSR>
+- Official weights: <https://huggingface.co/CSWRY/VOSR>
 
-**The model files download themselves on first use.** The first time you run the
-**VOSR 2.0 Model Loader**, any missing component is fetched from the pinned
-[`CSWRY/VOSR`](https://huggingface.co/CSWRY/VOSR) Hugging Face repo into your
-ComfyUI `models/` directory (~7 GB total), thus the first run will take a second. Nothing downloads at import or
-validation time, only the one pinned repo is ever contacted, and `torch.hub` is
-never used. If you prefer to place the files by hand, see
-[Model files](#model-files) — the loader skips the download whenever they are
-already present.
+## What this fork changes
 
-<!-- ---
-![VOSR2 is best for preserving fine structures and text readability.](./VOSR_cases/vis_comp.jpg) -->
----
+### 1. Attention backends
+
+ComfyUI's `main.py` sets `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` on every start, which is
+what makes PyTorch's fused SDPA backends selectable at all. On `gfx1103` the AOTriton kernel
+images are missing or unsuitable, and they fail in two different ways:
+
+| Call site | Failure mode |
+|---|---|
+| LightningDiT and DINOv2 | Launches, then reports asynchronously at the next CUDA call — surfaces as `CUDA error: invalid argument` inside DINOv2's `proj` Linear |
+| VAE mid block (4-D `(b, 1, N, c)`, fp32) | Does not fail. Returns an image covered in a regular grid — invisible at 512 px, obvious at 1200 px |
+
+`models/attention.py` is the single place that decides backend policy. It pins the exact-math
+backend for the small attentions and computes the same math chunked over the query axis for the
+VAE mid block, so nothing in the pipeline uses a fused ROCm kernel. Non-ROCm devices keep
+PyTorch's normal dispatch, so CUDA output is unchanged.
+
+### 2. Reference reproducibility
+
+VOSR 2.0 is a one-step model: a small difference in the low-quality input, the latent noise or
+the arithmetic becomes a large difference in the image. Three details of the ComfyUI port
+diverged from the upstream inference script and are now explicit options:
+
+| Contract | Upstream | This fork |
+|---|---|---|
+| Pre-scale | `Image.BICUBIC` on the 8-bit image | Same — `models/resize.py` calls Pillow on the same 8-bit data |
+| Latent noise | `torch.randn_like(latent)` from the global CUDA RNG after `manual_seed(seed)` | `noise_mode=reference` (default): the same draw, with the global CPU/CUDA states restored immediately afterwards so no other node is affected |
+| VAE tiling | Single pass unless `--vae_tile_size` is set | `vae_tiling=auto` (default): single pass up to 2048 px / 4.2 MP, tiled above only to avoid OOM |
+
+With fp32 and these policies, the reference's pre-scaled input, latent and latent noise
+reproduce bit-for-bit and the final image lands within **1/255** — the same difference two
+identical reference runs show on this hardware.
+
+### 3. Precision
+
+The upstream implementation is fp32 end to end. `fp32` is now selectable, and the reduced
+precision paths have been measured against the fp32 reference (128 px → 4x, 512² output):
+
+| `dtype` | Final image vs fp32 reference |
+|---|---|
+| `fp32` | 1/255 max, 0.50/255 mean |
+| `fp16` | 32/255 worst pixel, 0.59/255 mean |
+| `bf16` | 94/255 worst pixel, up to 5.73/255 mean — not recommended for this model |
+
+`default` follows ComfyUI's device policy (`unet_dtype()`); on this hardware that is fp16. Use
+`fp32` when you need to reproduce reference results.
+
+## Requirements
+
+- ComfyUI with an AMD GPU and a ROCm PyTorch build.
+- `einops`, `safetensors` and `huggingface_hub`, all bundled with ComfyUI.
+- Tested on: AMD Radeon 780M (`gfx1103`), torch 2.11.0+rocm10.0.0, ComfyUI 0.36.
+- Model files: ~7 GB total, downloaded on first use (see below).
+
+## Installation
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/<your-user>/ComfyUI-VOSR2-ROCM
+# restart ComfyUI
+```
+
+The first run downloads the VOSR 2.0 bundle from
+[`CSWRY/VOSR`](https://huggingface.co/CSWRY/VOSR) into `ComfyUI/models/vosr2/`. When managing
+the install by hand, prefer a symlink or junction from `custom_nodes/ComfyUI-VOSR2-ROCM` to a
+working checkout: edits then take effect on the next ComfyUI restart without reinstalling.
 
 ## Nodes
 
-Both appear under **`image/upscaling/VOSR2`**.
-
 ### VOSR 2.0 Model Loader (`VOSR2ModelLoader`)
-
-Loads a VOSR 2.0 bundle and returns a `VOSR2_MODEL` object. Split from the
-upscale node so that queued images do not rebuild several GB of weights.
 
 | Input | Default | Notes |
 |---|---|---|
 | `model` | `VOSR2` | Bundle folder under `models/vosr2/` — the DiT plus its matched VAE and vision encoder |
-| `dtype` | `default` | `default` / `fp16` / `bf16` / `fp32` for the DiT + vision encoder. The VAE always runs in fp32. `fp32` reproduces the reference; measured against it, `fp16` (`= default` here) stays under 0.6/255 mean (32/255 worst pixel) and `bf16` reaches 94/255 — see `docs/ROCm.md`. |
+| `dtype` | `default` | `default` / `fp16` / `bf16` / `fp32` for the DiT and vision encoder. The VAE always runs in fp32 |
 
-VOSR 2.0 is a **fixed DiT + VAE + vision-encoder set** — the DiT only works with
-the specific Qwen 2D VAE it was trained against, so the VAE and vision encoder
-aren't separate inputs; they live inside the bundle folder. Leave `model` on
-`VOSR2` unless you've added your own bundle. On the first run any missing part is
-downloaded from `CSWRY/VOSR`; `args.json` is then validated against the fixed
-VOSR 2.0 architecture before anything is constructed — an incompatible checkpoint
-fails loudly instead of loading partially.
+VOSR 2.0 is a fixed triple: the DiT only works with the Qwen 2D VAE it was trained against, and
+its conditioning is a specific DINOv2-L layer. The VAE and vision encoder are therefore bundle
+internals, not separate inputs.
 
 ### VOSR 2.0 Upscale (`VOSR2Upscale`)
-
-One-step super-resolution on an `IMAGE` batch.
 
 | Input | Default | Range | Notes |
 |---|---:|---|---|
 | `model` | — | `VOSR2_MODEL` | From the loader |
 | `image` | — | `IMAGE` | Single image or batch |
-| `upscale` | `4` | ≥ 1, uncapped | Exact output multiplier |
-| `seed` | `42` | ≥ 0 | Latent-noise seed. In `reference` noise mode the whole batch is one draw seeded with `seed` (what upstream does); in `isolated` mode item *i* uses `seed + i` |
+| `upscale` | `4` | ≥ 1, uncapped | Exact output multiplier; ~4x is the documented sweet spot |
+| `seed` | `42` | ≥ 0 | Latent-noise seed (see `noise_mode`) |
 | `color_alignment` | `wavelet` | `wavelet` / `adain` / `none` | Post-process against the bicubic target |
 | `tile_size` | `0` | `0`–`4096`, step 64 | DiT pixel tile; `0` disables tiling |
 | `tile_overlap` | `32` | `0`–`512`, step 8 | DiT tile overlap |
-| `vae_tile_size` | `0` | `0`–`8192`, step 64 | VAE pixel tile used *when* `vae_tiling` tiles; `0` means 1024 |
+| `vae_tile_size` | `0` | `0`–`8192`, step 64 | VAE pixel tile used when `vae_tiling` tiles; `0` means 1024 |
 | `vae_tile_overlap` | `32` | `0`–`512`, step 8 | VAE tile overlap |
-| `noise_mode` | `reference` | `reference` / `isolated` | `reference` draws the latent noise from the global CUDA RNG exactly as upstream does (reproducing reference results); `isolated` uses a private CPU generator and leaves global RNG state alone |
-| `vae_tiling` | `auto` | `auto` / `full` / `tiled` | `auto` runs the VAE single-pass up to 2048px / 4.2MP (the reference behaviour, no tile blending) and tiles above only to avoid OOM; `full` never tiles; `tiled` always tiles |
+| `noise_mode` | `reference` | `reference` / `isolated` | `reference` reproduces upstream's draw; `isolated` uses a private generator and leaves global RNG state alone (batch item *i* gets `seed + i`) |
+| `vae_tiling` | `auto` | `auto` / `full` / `tiled` | `auto` keeps the VAE single-pass (the reference behaviour, no tile blending) up to 2048 px / 4.2 MP; `tiled` always tiles at `vae_tile_size` |
 
-**Tiling is not optional above 512 px.** VOSR 2.0 was trained natively at up to
-512 px, so whenever the *upscaled* output exceeds 512×512 set `tile_size` (e.g.
-`512`) or quality degrades. The VAE is a separate question: it is purely
-convolutional and the reference runs it single-pass, so `vae_tiling=auto` tiles it
-only past 2048 px. Tiling the VAE blends overlapping tiles, which costs accuracy —
-don't set `vae_tiling=tiled` at small sizes.
-
----
+**Tiling is not optional above 512 px.** VOSR 2.0 was trained at up to 512 px, so whenever the
+*upscaled* output exceeds 512×512 set `tile_size` (e.g. `512`), or quality degrades.
 
 ## Model files
 
-> The VAE's latent space is specific to `ema_model.safetensors` — you can't swap
-> in a different VAE (unless the VOSR authors release a new matched one). Same for
-> the DINOv2-L encoder. All three are one set.
+A bundle lives at `ComfyUI/models/vosr2/<bundle>/`:
 
-**You normally don't need this section** — the loader downloads everything below
-from [`CSWRY/VOSR`](https://huggingface.co/CSWRY/VOSR) the first time it runs. It's
-here for offline installs, air-gapped machines, or if you'd rather manage the
-files yourself. The loader detects existing files and skips the download.
-
-Because the three pieces are one set, they live in **one bundle folder**,
-`models/vosr2/VOSR2/`:
-
-```
-ComfyUI/models/vosr2/VOSR2/
-├── args.json
-├── checkpoints/
-│   └── ema_model.safetensors
-├── Qwen-Image-vae-2d/
-│   ├── config.json
-│   └── diffusion_pytorch_model.safetensors
-└── dinov2_vitl14.safetensors
+```text
+models/vosr2/VOSR2/
+    args.json
+    checkpoints/ema_model.safetensors
+    Qwen-Image-vae-2d/{config.json, diffusion_pytorch_model.safetensors}
+    dinov2_vitl14.safetensors
 ```
 
-| File in `CSWRY/VOSR` | Direct download | Put it at |
-|---|---|---|
-| `VOSR2/args.json` | [link](https://huggingface.co/CSWRY/VOSR/resolve/main/VOSR2/args.json) | `models/vosr2/VOSR2/args.json` |
-| `VOSR2/checkpoints/ema_model.safetensors` | [link](https://huggingface.co/CSWRY/VOSR/resolve/main/VOSR2/checkpoints/ema_model.safetensors) | `models/vosr2/VOSR2/checkpoints/ema_model.safetensors` |
-| `Qwen-Image-vae-2d/config.json` | [link](https://huggingface.co/CSWRY/VOSR/resolve/main/Qwen-Image-vae-2d/config.json) | `models/vosr2/VOSR2/Qwen-Image-vae-2d/config.json` |
-| `Qwen-Image-vae-2d/diffusion_pytorch_model.safetensors` | [link](https://huggingface.co/CSWRY/VOSR/resolve/main/Qwen-Image-vae-2d/diffusion_pytorch_model.safetensors) | `models/vosr2/VOSR2/Qwen-Image-vae-2d/diffusion_pytorch_model.safetensors` |
-| `torch_cache/checkpoints/dinov2_vitl14_pretrain.pth` | [link](https://huggingface.co/CSWRY/VOSR/resolve/main/torch_cache/checkpoints/dinov2_vitl14_pretrain.pth) | convert → `models/vosr2/VOSR2/dinov2_vitl14.safetensors` (see below) |
+The loader fetches anything missing from `CSWRY/VOSR` on first use and validates `args.json`
+against the fixed VOSR 2.0 architecture before constructing anything. For offline installs:
 
-> The `model` dropdown is seeded with `VOSR2` and defaults to it. Drop additional
-> bundle folders next to it and they'll appear in the dropdown too (any subfolder
-> of `models/vosr2/` with an `args.json`), but only `VOSR2` is auto-downloaded.
-
-The DINOv2-L file in the repo is a raw PyTorch pickle
-(`dinov2_vitl14_pretrain.pth`); the loader converts it to
-`dinov2_vitl14.safetensors` automatically. To do it by hand, run this where
-ComfyUI's Python can `import torch`:
-
-```python
-import torch
-from safetensors.torch import save_file
-
-sd = torch.load("dinov2_vitl14_pretrain.pth", map_location="cpu", weights_only=True)
-save_file({k: v.contiguous() for k, v in sd.items()}, "dinov2_vitl14.safetensors")
-```
-
-then place `dinov2_vitl14.safetensors` in `models/vosr2/VOSR2/`. The keys
-are the original Meta `facebookresearch/dinov2` names
-(`blocks.N.attn.qkv.*`, `blocks.N.ls1.gamma`, …), matching the vendored
-architecture in [`models/dinov2.py`](models/dinov2.py) — do **not** use the
-Hugging Face `transformers` `facebook/dinov2-large` weights, whose keys differ.
-
----
-
-## Installation
-
-### Local ComfyUI
-
-You need a reasonably recent ComfyUI (one that ships `comfy_api.latest` — any
-build from 2025 onward). The only dependency is `huggingface_hub` (used to fetch
-the weights), which already ships with ComfyUI; `safetensors` and `einops` do
-too.
-
-**git clone (recommended until the node is on the Comfy Registry)**
-
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/ylchen333/ComfyUI-VOSR2
-# restart ComfyUI
-```
-
-Then add a **VOSR 2.0 Model Loader**, leave `model` on `VOSR2`, and run — the
-~7 GB bundle downloads from `CSWRY/VOSR` on that first execution and is reused
-afterward. (To pre-place it instead, see [Model files](#model-files).)
-
-#### Installing via Git URL
-
-**Manager → Custom Nodes Manager → Install via Git URL** with
-`https://github.com/ylchen333/ComfyUI-VOSR2` also works, but recent
-ComfyUI-Manager versions gate that button behind **both**:
-
-- `allow_git_url_install = true` in `config.ini` (`[default]` section — the file
-  is at `ComfyUI/user/default/ComfyUI-Manager/config.ini`), and
-- ComfyUI launched on a loopback address (`--listen 127.0.0.1`, `::1`, or no
-  `--listen` at all).
-
-Both are read once at startup, so change them with the server stopped, then
-restart. This is a ComfyUI-Manager policy, unrelated to this node — a plain
-`git clone` sidesteps it entirely, and once the node is published to
-registry.comfy.org it installs through Manager's normal search without either
-toggle.
-
-### RunComfy
-Via the Custom Nodes Manager, install 0.4.0 (or whatever the latest version is). Then restart.
-  
----
-
-## Usage
-
-### Example workflows
-
-- **[`example_workflows/vosr_workflow_examples.json`](example_workflows/vosr_workflow_examples.json)** —
-  a drag-and-drop starter file. Drop it onto the ComfyUI canvas to load
-  ready-made VOSR 2.0 graphs (loader → upscale, tiling presets already wired).
-  The quickest way to get going.
-- **`example_workflows/local_workflow.png`** — the same setup running locally in
-  ComfyUI, for reference:
-
-  ![VOSR 2.0 example workflow in ComfyUI](example_workflows/vosr_workflow_screenshot.png)
-
-- **RunComfy** — Link to workflow [here](https://www.runcomfy.com/comfyui-workflows/my-workflows?shared_workflow=764db3d9-242d-87a7-4157-3cd95923fea7).
-
-- **Comfy Cloud** — hosted example-workflow links will be added here once custom nodes are supported on Comfy Cloud.
-
-### Manual setup
-
-1. **VOSR 2.0 Model Loader** — leave `model` on `VOSR2` and `dtype` on `default`
-   (use `fp16`/`bf16` to save VRAM).
-2. Feed an image into **VOSR 2.0 Upscale** together with the loader's `model`
-   output.
-3. Set `upscale` (≥ 1, no hard cap — VOSR 2.0 was trained on degradations up
-   to 16x, but quality past ~4x isn't guaranteed and depends on the specific
-   image and resolution, not just the factor). If the result exceeds 512 px
-   on a side, set `tile_size = 512`. If it exceeds ~1024 px, also set
-   `vae_tile_size = 1024`.
-4. `color_alignment` defaults to `wavelet`; `adain` or `none` are available for
-   comparison.
-
-### Recommended VOSR 2.0 Upscale settings
-
-A solid general-purpose starting point (tiling on, for outputs past 512 px):
-
-| Parameter | Value |
+| File in `CSWRY/VOSR` | Put it at |
 |---|---|
-| `upscale` | `4` |
-| `seed` | `42` |
-| `color_alignment` | `wavelet` |
-| `tile_size` | `512` |
-| `tile_overlap` | `64` |
-| `vae_tile_size` | `1024` |
-| `vae_tile_overlap` | `128` |
+| [`VOSR2/args.json`](https://huggingface.co/CSWRY/VOSR/resolve/main/VOSR2/args.json) | `models/vosr2/VOSR2/args.json` |
+| [`VOSR2/checkpoints/ema_model.safetensors`](https://huggingface.co/CSWRY/VOSR/resolve/main/VOSR2/checkpoints/ema_model.safetensors) | `models/vosr2/VOSR2/checkpoints/ema_model.safetensors` |
+| [`Qwen-Image-vae-2d/config.json`](https://huggingface.co/CSWRY/VOSR/resolve/main/Qwen-Image-vae-2d/config.json) | `models/vosr2/VOSR2/Qwen-Image-vae-2d/config.json` |
+| [`Qwen-Image-vae-2d/diffusion_pytorch_model.safetensors`](https://huggingface.co/CSWRY/VOSR/resolve/main/Qwen-Image-vae-2d/diffusion_pytorch_model.safetensors) | `models/vosr2/VOSR2/Qwen-Image-vae-2d/diffusion_pytorch_model.safetensors` |
+| [`torch_cache/checkpoints/dinov2_vitl14_pretrain.pth`](https://huggingface.co/CSWRY/VOSR/resolve/main/torch_cache/checkpoints/dinov2_vitl14_pretrain.pth) | Convert to `models/vosr2/VOSR2/dinov2_vitl14.safetensors` (the loader does this automatically when downloading) |
 
-The node's own defaults keep tiling **off** (`tile_size` / `vae_tile_size` = `0`),
-which is only appropriate when the upscaled output stays at or below 512 px — set
-the values above for anything larger.
+## Memory and tiling
 
-Batches are first-class: item *i* is seeded with `seed + i`, so a batch result
-matches running each image separately.
+- `tile_size` bounds the DiT's peak memory; `vae_tiling` bounds the VAE's. They are independent.
+- On ROCm every attention runs the exact-math path, whose score matrix grows with the square of
+  the token count. That is why `tile_size` matters more here than on CUDA: an untiled 1200 px
+  image would need ~48 GiB of attention scratch, so DiT tiling is mandatory, not an
+  optimisation.
+- The VAE is purely convolutional and `vae_tiling=auto` keeps it single-pass at normal sizes,
+  which is both faster and closer to the reference than blending tiles. See
+  [`docs/avoiding-oom.md`](docs/avoiding-oom.md).
 
----
+## Verification
 
-## Notes on VRAM and tiling
+Everything above was measured, not assumed. The reference is the stock upstream
+`inference_vosr_onestep.py` run fp32 on the same machine with every intermediate captured; the
+fork replays it stage by stage:
 
-The upstream authors have no measured tile-size / VRAM table yet, and neither
-does this package. Treat these as starting points, not guarantees:
+| Stage | fp32, matched policies |
+|---|---|
+| Pre-scaled input, latent, latent noise | bit-identical |
+| DINOv2 layer-17 conditioning | 1.2e-4 max |
+| DiT velocity, SR latent | 1.3e-4 max |
+| Final image, untiled 512² and 1024² | 1/255 max, 0.50/255 mean |
+| Final image, tiled 8x (3x3 blend grid) | 1/255 max, 0.50/255 mean |
 
-- ≤ 512 px output: no tiling needed.
-- ~2048 px output: `tile_size = 512`.
-- ~4096 px output: `tile_size = 512`, `vae_tile_size = 1024`.
-
-`fp16` / `bf16` (via the loader's `dtype`) roughly halves DiT + vision-encoder
-memory; the Qwen VAE always runs in fp32.
-
----
-
-## VOSR2 examples
-
-**Interactive version:** Visit [VOSR 2.0 project page](https://cswry.github.io/vosr2/) and drag-to-reveal slider over each pair.
-
-<!-- <table>
-<tr>
-<td align="center"><b>Low resolution</b></td>
-<td align="center"><b>Upscaled</b></td>
-</tr>
-<tr>
-<td align="center">Building<br><img src="./VOSR_cases/building/lr.png" alt="low resolution building"></td>
-<td align="center">Building<br><img src="./VOSR_cases/building/vosr_2_0.png" alt="upscaled building"></td>
-</tr>
-<tr>
-<td align="center">Landscape<br><img src="./VOSR_cases/landscape/lr.png" alt="low resolution landscape"></td>
-<td align="center">Landscape<br><img src="./VOSR_cases/landscape/vosr_2_0.png" alt="upscaled landscape"></td>
-</tr>
-<tr>
-<td align="center">Faces<br><img src="./VOSR_cases/tiny_face/lr.png" alt="low resolution faces"></td>
-<td align="center">Faces<br><img src="./VOSR_cases/tiny_face/vosr_2_0.png" alt="upscaled faces"></td>
-</tr>
-<tr>
-<td align="center">English text<br><img src="./VOSR_cases/tiny_text_english/lr.png" alt="low resolution english text"></td>
-<td align="center">English text<br><img src="./VOSR_cases/tiny_text_english/vosr_2_0.png" alt="upscaled english text"></td>
-</tr>
-<tr>
-<td align="center">Chinese text<br><img src="./VOSR_cases/tiny_text_chinese/lr.png" alt="low resolution chinese text"></td>
-<td align="center">Chinese text<br><img src="./VOSR_cases/tiny_text_chinese/vosr_2_0.png" alt="upscaled chinese text"></td>
-</tr>
-</table> -->
-
----
-
-## Status
-
-In-progress v1.
-
-**Implemented:** model discovery/validation, first-run auto-download from
-`CSWRY/VOSR`, vendored DiT/VAE/DINOv2 architectures, ComfyUI-managed load/offload
-via `ModelPatcher`, untiled and tiled (DiT + VAE) inference, per-item seeded
-batching, torch-native `wavelet` / `adain` / `none` color alignment, and a
-drag-and-drop example workflow.
-
-**Install paths:** listed on the
-[Comfy Registry](https://registry.comfy.org/nodes/comfyui-vosr2) and installable
-on RunComfy via its Custom Nodes Manager — see [Installation](#installation).
-Note: the registry's automated scan currently **flags every release since
-`0.2.0`** (the first-run remote download), so ComfyUI-Manager / `comfy node
-install` still serve `0.1.0`. Use `git clone` for the current version until the
-flag is cleared.
-
-**Verified in CI** ([comfy-test](https://github.com/PozzettiAndrea/comfy-test),
-Linux/CPU, Python 3.10, PyTorch 2.10, ComfyUI 0.35.0): the package installs
-against a fresh ComfyUI, imports without error, and both nodes register with
-valid schemas. The model load + inference path is **not** exercised in CI — it
-needs a GPU.
-
-**Not yet done:** numeric validation against the upstream reference, measured
-VRAM/tile presets, GPU execution in CI, and the macOS / Windows CI matrix.
+See [`docs/ROCm.md`](docs/ROCm.md) for the isolation experiments behind the attention fix.
 
 ## Licensing
 
-This node package is released under the **Apache License 2.0** (see
-[`LICENSE`](LICENSE)), matching upstream VOSR.
-
-The **model weights are downloaded separately** from
-[CSWRY/VOSR](https://huggingface.co/CSWRY/VOSR) and carry their own terms —
-including the DINOv2 checkpoint (Meta, `facebookresearch/dinov2`) and the
-Qwen-Image VAE. Review those before redistribution or commercial use.
+The node code is Apache-2.0 (see [`LICENSE`](LICENSE)). Model weights are distributed by
+[`CSWRY/VOSR`](https://huggingface.co/CSWRY/VOSR) under their own terms; the DINOv2-L weights are
+CC-BY-NC 4.0 (non-commercial). Review those terms before any commercial use.
 
 ## Credits
 
 - **VOSR / VOSR 2.0** — Rongyuan Wu et al. ([cswry/VOSR](https://github.com/cswry/VOSR))
+- **ComfyUI node** — [ylchen333/ComfyUI-VOSR2](https://github.com/ylchen333/ComfyUI-VOSR2)
 - **DINOv2** — Meta AI ([facebookresearch/dinov2](https://github.com/facebookresearch/dinov2))
-- **Qwen-Image VAE** — Qwen team
-- ComfyUI integration: this repository

@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-vosr2"
-description = "ComfyUI node for VOSR 2.0 (one-step 1.4B) image super-resolution."
+description = "ComfyUI node for VOSR 2.0 (one-step 1.4B) image super-resolution. AMD ROCm build."
 version = "0.4.2"
 license = {file = "LICENSE"}
 dependencies = ["huggingface_hub"]
