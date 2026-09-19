@@ -85,6 +85,8 @@ The reference harness lives outside this repo, in `E:\ComfyUI_JZ\_vosr_diag`:
 - `a_boot.py` - runs the stock upstream CLI unchanged under that policy.
 - `a_dump.py` - the same math with every intermediate captured, plus the reference noise.
 - `micro_probe.py` - the two contract probes above (noise draw, pre-scale kernels).
+- `tiled_check.py` - upstream's `tiled_latent_inference` vs this branch's tiling, at a size
+  where the blend grid is real.
 
 `outDump\intermediates.pt` (64x64 -> 2x, seed 42, fp32, untiled, `nofix`) is the parity
 target: `lq`, `lq_latent`, `venc_layer17`, `noise`, DiT `u`, `sr_latent`, `sr_tensor`, final
@@ -94,3 +96,9 @@ pixels. The four stock/dump runs agree to max 1/255, so the harness is faithful.
 branch stage by stage and per dtype, and also checks the node contract -- every declared
 input must be an `execute` parameter in the same order, since the frontend maps a saved
 workflow's positional `widgets_values` onto that order.
+
+That tool covers the untiled path only; any real resolution runs *tiled*. `tiled_check.py`
+covers that: 128px -> 8x with `--tile_size 512` resolves to latent 128, tile 64, overlap 8
+-- a genuine 3x3 blend grid -- and with both sides under the same policy the final image
+differs by max 1/255, mean 0.500, with no pixel off by more than 2/255.
+
