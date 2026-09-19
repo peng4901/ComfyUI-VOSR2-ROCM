@@ -25,8 +25,15 @@ same bundle folder as the DiT weights, under
     30-series/A-series) or newer NVIDIA GPU, or an equivalent ROCm/other
     device. On unsupported hardware this can silently degrade output quality
     or fail deep inside the model rather than at load time.
+  - `fp32` — what the reference implementation computes. Reproduces reference
+    results exactly; costs roughly twice the DiT memory and time.
   - The VAE always runs in fp32 regardless of this setting — its latent space
     is precision-sensitive, so this isn't configurable.
+
+VOSR 2.0 is one-step, so a small numeric difference in the DiT becomes a large
+one in the image. Measured against the reference on an fp32 baseline, `fp16`
+stays under 0.6/255 mean (worst pixel 32/255) and `bf16` reaches 94/255 — prefer
+`fp32` when you need reproducibility, and avoid `bf16` for this model.
 
 ## Notes
 

@@ -40,7 +40,7 @@ Output: private type `VOSR2_MODEL`
 | Input | Type/default | Contract |
 |---|---|---|
 | `model` | combo, default `VOSR2` | VOSR2 bundle folder under `ComfyUI/models/vosr2`; options are the disk scan plus the always-present confirmed name |
-| `dtype` | `default` | `default`, `fp16`, or `bf16`; default follows ComfyUI policy |
+| `dtype` | `default` | `default`, `fp16`, `bf16`, or `fp32`; default follows ComfyUI policy |
 
 VOSR 2.0 is a **fixed, tightly coupled DiT/VAE/vision triple** — the DiT operates
 entirely in *this* Qwen 2D VAE's latent space (its channel count, downsample
@@ -72,8 +72,10 @@ Input/output: ComfyUI `IMAGE`, `BHWC` RGB float `[0,1]`
 | `color_alignment` | `wavelet` | `wavelet`, `adain`, `none` | Upstream postprocessing mode |
 | `tile_size` | `0` | `0..4096`, step 64 | DiT pixel tile; zero disables |
 | `tile_overlap` | `32` | `0..512`, step 8 | DiT overlap in pixels |
-| `vae_tile_size` | `0` | `0..8192`, step 64 | VAE pixel tile; zero disables |
+| `vae_tile_size` | `0` | `0..8192`, step 64 | VAE pixel tile used when `vae_tiling` tiles; `0` means 1024 |
 | `vae_tile_overlap` | `32` | `0..512`, step 8 | VAE overlap in pixels |
+| `noise_mode` | `reference` | `reference`, `isolated` | `reference` reproduces upstream's global-RNG draw; `isolated` uses a private generator and leaves global RNG state untouched |
+| `vae_tiling` | `auto` | `auto`, `full`, `tiled` | Whether the VAE runs single-pass or tiled |
 
 Do not expose `infer_steps` in v1. VOSR2 is released as a one-step model; arbitrary values imply an unsupported quality control. **`cfg_scale` and `weak_cond_strength_aelq` are likewise excluded — author-confirmed (2026-09-01) to have no effect on VOSR 2.0 inference**, not merely inferred from the reference implementation.
 
@@ -145,12 +147,12 @@ Load state dicts strictly after stripping only documented prefixes. If known tra
 For each image:
 
 1. Compute exact target dimensions as input width/height times `upscale`.
-2. Bicubic-resize to the target dimensions. This matches upstream behavior: scaling occurs before VAE/DiT restoration.
+2. Bicubic-resize to the target dimensions, matching upstream exactly: upstream resizes the *8-bit* PIL image (`raw_img.resize(..., Image.BICUBIC)`) and feeds the result through `ToTensor()`. PyTorch's own bicubic (`a=-0.75`, one float pass) is not equivalent to Pillow's (`a=-0.5`, 8-bit intermediate) and diverges by up to 7.2/255 on the reference's own input, which this one-step model then amplifies ~10x at the output. So the resize goes through Pillow on uint8, and the `IMAGE` input is treated as the 8-bit image the reference treats it as. Scaling occurs before VAE/DiT restoration.
 3. Convert `BHWC [0,1]` to `BCHW [-1,1]` on the compute device.
 4. Right/bottom pad to a multiple of 16 (VAE factor 8 times DiT patch 2); remember the exact target size.
 5. VAE-encode using `latent_dist.mode()`, retaining upstream Qwen latent mean/std normalization.
-6. Build vision conditioning: bicubic resize to 448x448, ImageNet mean/std normalize, run DINOv2-L, and select normalized layer-17 patch tokens.
-7. Create noise with a local `torch.Generator`. Item `i` uses `seed + i`; do not alter global PyTorch or NumPy RNG state.
+6. Build vision conditioning: bicubic resize to 448x448, ImageNet mean/std normalize, run DINOv2-L, and select normalized layer-17 patches. This resize *is* a plain `F.interpolate`, because upstream uses one too.
+7. Create the noise field according to `noise_mode`. `reference` reproduces upstream's draw -- the global CUDA generator after `manual_seed(seed)`, one draw over the whole batch -- with the global CPU/CUDA RNG states saved and restored around it so no other node is affected. `isolated` uses a local `torch.Generator` instead and gives item `i` the seed `seed + i`.
 8. Perform exactly one flow update, `t=1` to `t=0`, using `LightningDiT.forward_flexible`.
 9. Decode, crop to exact target size, map to `[0,1]`, and apply color alignment against the bicubic target.
 10. Return `BHWC` float on ComfyUI's intermediate/output device without PIL or uint8 quantization.
@@ -168,7 +170,7 @@ Port upstream latent tiling without changing its math:
 - Gaussian-blend tile velocity predictions, then apply the one global flow update.
 - If the latent fits one tile, use the untiled path.
 
-Port the Qwen-specific VAE encode/decode tiling and Gaussian blending from `tiled_vae.py`. DiT and VAE tiling remain independent. Pad before tiling and crop only after decoding.
+Port the Qwen-specific VAE encode/decode tiling and Gaussian blending from `tiled_vae.py`. DiT and VAE tiling stay independent, but they are not symmetric: upstream tiles the *DiT* whenever the DiT tile is set, and tiles the VAE only as a memory escape hatch, because Gaussian blending across VAE tiles is an approximation the reference never pays for. `vae_tiling` decides (`auto` = single-pass up to 2048px / 4.2MP, tiled above; `full` = never tiled; `tiled` = always). Pad before tiling and crop only after decoding.
 
 ## Color alignment
 
@@ -305,7 +307,8 @@ Unit coverage:
 
 - layout/range conversion round-trip
 - pad-to-16 and exact crop for odd sizes
-- stable local noise for identical seeds and distinct batch-index noise
+- `reference` noise reproduces upstream's global-RNG draw bit-for-bit and restores the global CPU/CUDA states; `isolated` noise gives identical seeds the same field and distinct batch indices distinct fields
+- Pillow pre-scale reproduces upstream's `lq` bit-for-bit, including for an input that is already uint8-quantized
 - AdaIN statistics and wavelet range
 - complete tile-grid coverage and nonzero blend denominators
 - safe path resolution and deterministic checkpoint selection
@@ -314,16 +317,16 @@ Unit coverage:
 Integration coverage:
 
 - load all supplied assets with network disabled
-- compare a fixed image/seed with upstream using `color_alignment=none`
+- compare a fixed image/seed with upstream using `color_alignment=none`: `tools/parity_check.py` replays a captured upstream dump stage by stage, and checks that the node schema and `execute` parameter lists agree in order
 - compare float wavelet output before upstream PNG quantization
 - exact 1x, 2x, 3x, and 4x dimensions for odd inputs
-- batch result equals separate item runs under the defined seed rule
+- batch result equals separate item runs under the `isolated` seed rule
 - tiled and untiled outputs are numerically/visually close (not necessarily bit-identical)
 - repeated queues do not reconstruct models
 - ComfyUI unload/reload returns every component to the proper device
 - **visually inspect enlarged/upscaled face regions for grid-pattern artifacts across a few test images** — author-flagged (2026-09-01) as a known, more-serious-than-usual open issue currently under investigation upstream; document whether reproduced locally, and don't treat a clean result on one test image as resolving it
 
-Measure time and peak VRAM for 512, 2048 (DiT tile 512), and 4096 targets (DiT 512, VAE 1024), for fp16/bf16 only where hardware supports them.
+Measure time and peak VRAM for 512, 2048 (DiT tile 512), and 4096 targets (DiT 512, VAE 1024), for fp16/bf16 only where hardware supports them. Precision deviates from the fp32 reference by up to 9/255 (fp16) and 94/255 (bf16); see `docs/ROCm.md`.
 
 ## Acceptance criteria
 
@@ -332,11 +335,11 @@ V1 is complete when:
 1. Both nodes load without custom routes or frontend code.
 2. All components load only from configured local model folders.
 3. An image batch returns exact-size results for every exposed scale.
-4. Identical image/settings/seed reproduce identical output.
-5. Fixed untiled output matches upstream within an agreed pre-encoding tolerance.
+4. Identical image/settings/seed reproduce identical output, up to this box's 1/255 noise floor.
+5. Fixed untiled output matches upstream within an agreed pre-encoding tolerance — reached: with fp32 and the reference contract above, the pre-scale, the VAE latent and the noise are bit-identical and the final image is within 1/255, which is this box's floor (two identical *stock* upstream runs also differ by 1/255).
 6. Both tiling modes have full coverage, no obvious seams, and no persistent tensor cache.
 7. ComfyUI can offload/reload components without reconstructing them.
-8. No path uses `torch.hub`, writes output images, changes global RNG, or replaces the user's PyTorch installation. Downloads are limited to the pinned `CSWRY/VOSR` repo, happen only when the expected local file is absent, and never occur at import or `VALIDATE_INPUTS` time.
+8. No path uses `torch.hub`, writes output images, or replaces the user's PyTorch installation. Downloads are limited to the pinned `CSWRY/VOSR` repo, happen only when the expected local file is absent, and never occur at import or `VALIDATE_INPUTS` time. `noise_mode=reference` seeds the global RNG but restores the exact prior CPU/CUDA states before returning, so global RNG state is unchanged.
 
 ## Implementation sequence
 

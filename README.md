@@ -35,7 +35,7 @@ upscale node so that queued images do not rebuild several GB of weights.
 | Input | Default | Notes |
 |---|---|---|
 | `model` | `VOSR2` | Bundle folder under `models/vosr2/` — the DiT plus its matched VAE and vision encoder |
-| `dtype` | `default` | `default` / `fp16` / `bf16` for the DiT + vision encoder. The VAE always runs in fp32. |
+| `dtype` | `default` | `default` / `fp16` / `bf16` / `fp32` for the DiT + vision encoder. The VAE always runs in fp32. `fp32` reproduces the reference; measured against it, `fp16` (`= default` here) stays under 0.6/255 mean (32/255 worst pixel) and `bf16` reaches 94/255 — see `docs/ROCm.md`. |
 
 VOSR 2.0 is a **fixed DiT + VAE + vision-encoder set** — the DiT only works with
 the specific Qwen 2D VAE it was trained against, so the VAE and vision encoder
@@ -54,17 +54,21 @@ One-step super-resolution on an `IMAGE` batch.
 | `model` | — | `VOSR2_MODEL` | From the loader |
 | `image` | — | `IMAGE` | Single image or batch |
 | `upscale` | `4` | ≥ 1, uncapped | Exact output multiplier |
-| `seed` | `42` | ≥ 0 | Latent-noise seed; batch item *i* uses `seed + i` |
+| `seed` | `42` | ≥ 0 | Latent-noise seed. In `reference` noise mode the whole batch is one draw seeded with `seed` (what upstream does); in `isolated` mode item *i* uses `seed + i` |
 | `color_alignment` | `wavelet` | `wavelet` / `adain` / `none` | Post-process against the bicubic target |
 | `tile_size` | `0` | `0`–`4096`, step 64 | DiT pixel tile; `0` disables tiling |
 | `tile_overlap` | `32` | `0`–`512`, step 8 | DiT tile overlap |
-| `vae_tile_size` | `0` | `0`–`8192`, step 64 | VAE pixel tile; `0` decodes the whole image in one pass |
+| `vae_tile_size` | `0` | `0`–`8192`, step 64 | VAE pixel tile used *when* `vae_tiling` tiles; `0` means 1024 |
 | `vae_tile_overlap` | `32` | `0`–`512`, step 8 | VAE tile overlap |
+| `noise_mode` | `reference` | `reference` / `isolated` | `reference` draws the latent noise from the global CUDA RNG exactly as upstream does (reproducing reference results); `isolated` uses a private CPU generator and leaves global RNG state alone |
+| `vae_tiling` | `auto` | `auto` / `full` / `tiled` | `auto` runs the VAE single-pass up to 2048px / 4.2MP (the reference behaviour, no tile blending) and tiles above only to avoid OOM; `full` never tiles; `tiled` always tiles |
 
 **Tiling is not optional above 512 px.** VOSR 2.0 was trained natively at up to
 512 px, so whenever the *upscaled* output exceeds 512×512 set `tile_size` (e.g.
-`512`) or quality degrades. For outputs much past 1024 px also set
-`vae_tile_size` (e.g. `1024`) or the full-image VAE decode will likely OOM.
+`512`) or quality degrades. The VAE is a separate question: it is purely
+convolutional and the reference runs it single-pass, so `vae_tiling=auto` tiles it
+only past 2048 px. Tiling the VAE blends overlapping tiles, which costs accuracy —
+don't set `vae_tiling=tiled` at small sizes.
 
 ---
 

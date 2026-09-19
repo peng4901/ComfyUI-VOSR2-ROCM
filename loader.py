@@ -297,14 +297,19 @@ def _load_state_dict_lean(module: torch.nn.Module, path: Path, dtype: torch.dtyp
     gc.collect()
 
 
+DTYPE_OPTIONS = ("default", "fp16", "bf16", "fp32")
+
+
 def _resolve_dtype(dtype: str, device) -> torch.dtype:
     if dtype == "fp16":
         return torch.float16
     if dtype == "bf16":
         return torch.bfloat16
+    if dtype == "fp32":
+        return torch.float32
     if dtype == "default":
         return comfy.model_management.unet_dtype(device=device)
-    raise VOSR2LoadError(f"Unknown dtype option: {dtype!r}")
+    raise VOSR2LoadError(f"Unknown dtype option: {dtype!r}; expected one of {DTYPE_OPTIONS}.")
 
 
 class VOSR2Model:
