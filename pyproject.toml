@@ -6,12 +6,13 @@ license = {file = "LICENSE"}
 dependencies = ["huggingface_hub"]
 
 [project.urls]
-Repository = "https://github.com/ylchen333/ComfyUI-VOSR2"
+Repository = "https://github.com/peng4901/ComfyUI-VOSR2-ROCM"
+Upstream = "https://github.com/ylchen333/ComfyUI-VOSR2"
 "Official Model" = "https://huggingface.co/CSWRY/VOSR"
 "Official Project" = "https://github.com/cswry/VOSR"
 
 [tool.comfy]
-PublisherId = "ylchen333"
-DisplayName = "VOSR 2.0"
+PublisherId = "peng4901"
+DisplayName = "VOSR 2.0 (ROCm)"
 Icon = ""
 includes = []
