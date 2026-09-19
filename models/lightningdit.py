@@ -19,6 +19,7 @@ import torch.nn.functional as F
 
 import comfy.ops
 
+from .attention import scaled_dot_product_attention
 from .pos_embed import VisionRotaryEmbeddingFast
 from .rmsnorm import RMSNorm
 from .swiglu_ffn import SwiGLUFFN
@@ -91,7 +92,7 @@ class MultiHeadCrossAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        x = F.scaled_dot_product_attention(q, k, v)
+        x = scaled_dot_product_attention(q, k, v)
         x = x.permute(0, 2, 1, 3).contiguous().view(B, N, C)
         return self.proj(x)
 
@@ -133,7 +134,7 @@ class Attention(nn.Module):
             q = rope(q)
             k = rope(k)
 
-        x = F.scaled_dot_product_attention(q, k, v)
+        x = scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2).reshape(B, N, C)
         return self.proj(x)
 

@@ -17,6 +17,8 @@ import torch.nn.functional as F
 
 import comfy.ops
 
+from .attention import scaled_dot_product_attention
+
 # comfy.ops.disable_weight_init.{Conv2d,Linear,LayerNorm} subclass the plain
 # torch.nn equivalents directly (same state_dict keys, same forward() unless
 # ComfyUI later patches weights), skipping only their random-init cost -- so
@@ -67,7 +69,7 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
-        x = F.scaled_dot_product_attention(q, k, v)
+        x = scaled_dot_product_attention(q, k, v)
         x = x.transpose(1, 2).reshape(B, N, C)
         return self.proj(x)
 
