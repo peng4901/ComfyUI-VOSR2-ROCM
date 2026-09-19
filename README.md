@@ -1,3 +1,5 @@
+**English** | [简体中文](README.zh-CN.md)
+
 # ComfyUI-VOSR2-ROCM
 
 An AMD ROCm build of the [ComfyUI-VOSR2](https://github.com/ylchen333/ComfyUI-VOSR2) node for
