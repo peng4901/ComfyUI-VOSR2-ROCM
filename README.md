@@ -72,7 +72,7 @@ precision paths have been measured against the fp32 reference (128 px → 4x, 51
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/<your-user>/ComfyUI-VOSR2-ROCM
+git clone https://github.com/peng4901/ComfyUI-VOSR2-ROCM
 # restart ComfyUI
 ```
 
