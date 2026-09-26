@@ -1,4 +1,4 @@
-# Attention dispatch for VOSR2's three attention sites: the two bf16 modules (DINOv2 and
+# Attention dispatch for VOSR2's three attention sites: the two fp16 modules (DINOv2 and
 # LightningDiT) and the fp32 VAE's mid block.
 #
 # PyTorch's ROCm attention kernels (AOTriton) are shipped per gfx arch, but torch still
@@ -15,32 +15,31 @@
 # says is *chosen* to select a fused kernel -- does not fail at all: it silently covers the
 # whole image in a regular grid pattern.
 #
-# That grid is what a user sees at 1200px. It was traced here, not guessed: with the env var
-# set, a bare script reproduces it; with the env var unset (same code, same input, same seed,
-# same noise) the same script is clean and matches the fp32 reference to 1/255. The only
-# SDPA call site the DiT-oriented pin did not cover was the VAE mid block.
-#
-# So nothing in VOSR2 uses a fused SDPA kernel on ROCm. `scaled_dot_product_attention` pins
-# the exact-math backend for the small attentions (DINOv2's 1024 tokens, the DiT's 4096-token
-# latent tiles). `bounded_attention` computes the same math chunked over the query axis for
-# the VAE mid block, whose token count makes the O(N^2) score matrix the binding constraint
-# (22500 tokens at 1200px, 262144 at 4096px -- a 2 GiB and a 274 GiB single-shot allocation).
-#
 # ---------------------------------------------------------------------------------------
-# 实验分支 exp/sage-attention：给两个 fp16 站点接 SageAttention
+# Which kernel each site gets
 #
-# 精确数学路径在这块卡上很贵：4096 token、24 头的注意力，MATH 后端要物化 (24, 4096, 4096)
-# 的分数矩阵，实测单次 482.9 ms；同样形状 SageAttention 只要 2.4 ms。DINOv2 那边是
-# 14.0 ms -> 1.9 ms。这个文件是 VOSR2 所有注意力的唯一出口（dinov2.py、lightningdit.py、
-# qwenimage_vae2d.py 都从这里 import），所以接线只需要动这一个文件。
+#   CUDA  : torch's own SDPA dispatch, which already prefers flash -> mem-efficient -> math.
+#           Left alone; there is nothing to improve and no silent-failure history here.
+#   ROCm  : SageAttention when it is installed, usable, and passes a one-off self-test;
+#           otherwise the exact-math backend. The fused SDPA backends are NOT tried on
+#           ROCm even as a fallback -- see the note below.
+#   VAE   : always the exact chunked path. Sage's kernel needs 131072 bytes of shared memory
+#           for this site's (1, 1, 22500, 512) fp32 single-head shape and the hardware limit
+#           is 65536, so it simply cannot take it.
 #
-# 默认关闭，行为与 main 完全一致；用 VOSR2_SAGE_ATTENTION=1 打开。
+# Why the fused backends are not attempted on ROCm: on this arch they do not reliably raise.
+# The VAE grid artifact was a fused kernel returning wrong numbers with no error at all, and
+# a failed async kernel launch surfaces at whatever unrelated op runs next -- so a
+# try/except around a probe call cannot contain it. Preferring them "when available" would
+# mean silently preferring a known-broken path. `VOSR2_ATTENTION=exact` forces the old
+# behaviour everywhere.
 #
-# VAE mid block 接不了 Sage：它是 (1, 1, 22500, 512) 的 fp32 单头注意力，Sage 的 kernel
-# 要 131072 字节共享内存，硬件上限 65536，直接 OutOfResources。单头 512 通道也没法拆头
-# 绕开（拆头会改变语义），所以它继续走 bounded_attention 的分块精确路径。
-#
-# Sage 是 8-bit 量化的注意力，不是零损失，所以开之前必须用真实输入对过最终成图。
+# The self-test exists because a wrong-layout or wrong-API kernel can return plausible
+# garbage without raising. Measured example: this build of sageattn takes NHD (B, N, H, D),
+# not the HND (B, H, N, D) layout ComfyUI's own attention_sage uses. Feeding HND returned a
+# result with cosine similarity 0.008 to the correct answer and produced a blocky mess --
+# no exception, no warning. The self-test compares against the exact reference on the real
+# shape and refuses anything under 0.99.
 # ---------------------------------------------------------------------------------------
 import atexit
 import os
@@ -50,14 +49,21 @@ import torch
 import torch.nn.functional as F
 
 _OFF_VALUES = ("", "0", "false", "off", "no")
-# 每次调用都读一遍环境变量：这样同一个进程里就能开关对比（A/B 跑两遍不用重启），
-# 每次只多一次 os.environ.get，相对单次注意力几百毫秒可以忽略。
-_disabled_after_error = False
 
 
-def sage_wanted() -> bool:
-    return not _disabled_after_error and \
-        os.environ.get("VOSR2_SAGE_ATTENTION", "").strip().lower() not in _OFF_VALUES
+def _exact_requested() -> bool:
+    """VOSR2_ATTENTION=exact 强制走精确数学路径（老行为）。
+
+    VOSR2_SAGE_ATTENTION=0 也认，那是试着接 Sage 时留下的开关。
+    """
+    for key in ("VOSR2_ATTENTION", "VOSR2_SAGE_ATTENTION"):
+        v = os.environ.get(key)
+        if v is None:
+            continue
+        v = v.strip().lower()
+        if v in ("exact", "off", "0", "false", "no"):
+            return True
+    return False
 
 
 PROFILE = os.environ.get("VOSR2_PROFILE", "").strip().lower() not in _OFF_VALUES
@@ -83,58 +89,106 @@ def _dump_stats() -> None:
 if torch.version.hip is not None:
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
-    _sage_fn = None
-    _sage_tried = False
-
-    def _sageattn():
-        """惰性加载 SageAttention；失败就永久回落，不反复重试、不刷日志。"""
-        global _sage_fn, _sage_tried
-        if _sage_tried:
-            return _sage_fn
-        _sage_tried = True
-        try:
-            from sageattention import sageattn
-
-            _sage_fn = sageattn
-            print("[vosr2] VOSR2_SAGE_ATTENTION=1：DINOv2 / LightningDiT 的注意力改走 SageAttention，"
-                  "VAE mid block 仍是分块精确路径。")
-        except Exception as exc:  # 没装 / 装坏 / 这个 arch 上的内核编译失败
-            print(f"[vosr2] 想用 SageAttention 但加载失败（{type(exc).__name__}: {exc}），"
-                  "两个 fp16 站点回落到精确数学路径。")
-        return _sage_fn
+    _KERNEL = None          # None = 还没定 | "sage" | "exact"
+    _KERNEL_NOTE = ""
 
     def _exact(q, k, v):
         with sdpa_kernel([SDPBackend.MATH]):
             return F.scaled_dot_product_attention(q, k, v)
 
+    def _sage_call(q, k, v):
+        """调用这套 build 的 sageattn。
+
+        ⚠️ 布局：这台机器上的 sageattn 按 NHD 取数，即 (B, N, H, D)，而 VOSR2 传进来的是
+        (B, H, N, D)。喂错不报错，但结果是垃圾（实测余弦 0.008，图变方块乱码）。
+        转成 NHD 喂、结果转回 HND 之后余弦 0.99992。这跟 ComfyUI 自带的 attention_sage
+        （用 HND、会传 tensor_layout=）不是同一个 API 世代，别照抄那边的写法。
+        """
+        from sageattention import sageattn
+
+        return sageattn(q.transpose(1, 2).contiguous(),
+                        k.transpose(1, 2).contiguous(),
+                        v.transpose(1, 2).contiguous()).transpose(1, 2)
+
+    def _selftest(fn, q, k, v, min_cos: float = 0.99, max_rel: float = 0.05) -> bool:
+        """拿真实形状和 dtype 跑一次，跟精确参考比。只跑一次，毫秒级。
+
+        两个刻意的设计，都是踩过坑之后加的：
+
+        1. **用独立的随机 q/k/v，不用传进来的那几个。** 一开始图省事复用了真实张量，而调用
+           方经常是 ``attn(x)`` 里 q=k=v 同源，这时注意力权重被对角项主导，输出≈输入本身，
+           于是一个布局完全喂反的内核也能拿到很高的余弦相似度 —— 自检形同虚设。独立随机
+           输入才能让"结果是不是真算出来的"变得可判。
+        2. **余弦之外还看相对幅度。** 余弦是尺度无关的，一个方向对、幅度差十倍的内核能轻松
+           过线；这里再要求最大逐元素偏差不超过参考峰值的 5%。
+
+        它专门拦"不报错但算错"的内核（布局喂反、API 对不上）。至于量化误差这类数据相关的
+        质量差异，自检判不了，那是 A/B 对比要回答的问题。
+        """
+        n = min(q.shape[-2], 128)
+        if n < 2:
+            return False
+        shape = (q.shape[0], q.shape[1], n, q.shape[-1])
+        qs = torch.randn(shape, device=q.device, dtype=q.dtype)
+        ks = torch.randn(shape, device=q.device, dtype=q.dtype)
+        vs = torch.randn(shape, device=q.device, dtype=q.dtype)
+        try:
+            got = fn(qs, ks, vs)
+        except Exception:
+            return False
+        with sdpa_kernel([SDPBackend.MATH]):
+            want = F.scaled_dot_product_attention(qs.float(), ks.float(), vs.float())
+        if got.shape != want.shape or not torch.isfinite(got).all():
+            return False
+        g, w = got.float().reshape(-1), want.reshape(-1)
+        cos = F.cosine_similarity(g, w, dim=0).item()
+        rel = (g - w).abs().max().item() / (w.abs().max().item() + 1e-6)
+        return cos >= min_cos and rel <= max_rel
+
+    def _select(q, k, v) -> str:
+        """第一次调用时定下用哪个内核，之后不变。"""
+        global _KERNEL, _KERNEL_NOTE
+        if _KERNEL is not None:
+            return _KERNEL
+        if _exact_requested():
+            _KERNEL, _KERNEL_NOTE = "exact", "VOSR2_ATTENTION=exact"
+            return _KERNEL
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            _KERNEL, _KERNEL_NOTE = "exact", f"dtype={q.dtype} 不是 fp16/bf16，Sage 需要半精度"
+            print(f"[vosr2] {_KERNEL_NOTE}，走精确数学路径。")
+            return _KERNEL
+        try:
+            import sageattention  # noqa: F401
+        except Exception as exc:
+            _KERNEL, _KERNEL_NOTE = "exact", f"sageattention 不可用（{type(exc).__name__}）"
+            print(f"[vosr2] {_KERNEL_NOTE}，走精确数学路径。")
+            return _KERNEL
+        if _selftest(_sage_call, q, k, v):
+            _KERNEL, _KERNEL_NOTE = "sage", "SageAttention 自检通过（与精确参考余弦 ≥ 0.99）"
+            print("[vosr2] DINOv2 / LightningDiT 的注意力走 SageAttention；"
+                  "VAE mid block 仍是分块精确路径。")
+        else:
+            _KERNEL, _KERNEL_NOTE = "exact", "SageAttention 自检没过，永久回落到精确数学路径"
+            print(f"[vosr2] {_KERNEL_NOTE}（自检余弦 < 0.99）。")
+        return _KERNEL
+
     def scaled_dot_product_attention(q, k, v):
-        global _disabled_after_error
-        if sage_wanted() and q.dtype in (torch.float16, torch.bfloat16):
-            fn = _sageattn()
-            if fn is not None:
-                try:
-                    if PROFILE:
-                        torch.cuda.synchronize()
-                        t0 = time.perf_counter()
-                    # ⚠️ 布局：这台机器上装的 sageattn 按 NHD 取数，即 (B, N, H, D)，
-                    # 而 VOSR2 这三处传进来的都是 (B, H, N, D)。直接喂 HND 不会报错，
-                    # 但输出跟正确结果完全无关（实测余弦相似度 0.008），最终图会变成方块乱码。
-                    # 转成 NHD 再喂、结果转回 HND 之后，余弦 0.99992、最大差 0.018 —— 那点差
-                    # 才是 int8 量化的真实代价。
-                    # 注意这跟 ComfyUI 自带的 attention_sage（用 HND、传 tensor_layout=）
-                    # 不是同一个 API 世代，别照抄那边的调用方式。
-                    out = fn(q.transpose(1, 2).contiguous(),
-                             k.transpose(1, 2).contiguous(),
-                             v.transpose(1, 2).contiguous())
-                    out = out.transpose(1, 2)
-                    if PROFILE:
-                        torch.cuda.synchronize()
-                        _tick("sageattention", time.perf_counter() - t0)
-                    return out
-                except Exception as exc:
-                    _disabled_after_error = True
-                    print(f"[vosr2] sageattn 调用失败（{type(exc).__name__}: {str(exc)[:140]}），"
-                          "本次及后续一律回落到精确数学路径。")
+        kernel = _select(q, k, v)
+        if kernel == "sage":
+            try:
+                if PROFILE:
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
+                out = _sage_call(q, k, v)
+                if PROFILE:
+                    torch.cuda.synchronize()
+                    _tick("sageattention", time.perf_counter() - t0)
+                return out
+            except Exception as exc:
+                # 自检过了但真跑挂了：整段退回去，别在同一张图里混用两种算法。
+                global _KERNEL, _KERNEL_NOTE
+                _KERNEL, _KERNEL_NOTE = "exact", f"sageattn 运行期失败（{type(exc).__name__}）"
+                print(f"[vosr2] {_KERNEL_NOTE}，本次及后续回落到精确数学路径。")
         if PROFILE:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -151,7 +205,8 @@ if torch.version.hip is not None:
         computed one query block at a time, so peak allocation is `max_score_elements`
         instead of chunk x N. A single pinned call is used when the matrix already fits.
 
-        Sage 在这条路上用不了（见文件头），所以这里永远走精确数学。
+        这条路上接不了 SageAttention（见文件头：fp32 单头 512 通道超出共享内存上限），
+        所以 VAE 永远走精确数学。
         """
         n = q.shape[-2]
         chunk = max(1, min(n, max_score_elements // max(n, 1)))
@@ -178,6 +233,8 @@ if torch.version.hip is not None:
             _tick(f"vae-mid 精确({(n + chunk - 1) // chunk} 块)", time.perf_counter() - t0)
         return out
 else:
+    # CUDA and friends: torch's own dispatch already prefers flash -> mem-efficient -> math,
+    # so there is nothing to pin here.
     def scaled_dot_product_attention(q, k, v):
         return F.scaled_dot_product_attention(q, k, v)
 

@@ -26,9 +26,18 @@ ComfyUI 的 `main.py` 每次启动都会设置 `TORCH_ROCM_AOTRITON_ENABLE_EXPER
 | LightningDiT 与 DINOv2 | 能启动，但要等到**下一次** CUDA 调用才异步报错 —— 表现为 DINOv2 `proj` Linear 处的 `CUDA error: invalid argument` |
 | VAE mid block（4 维 `(b, 1, N, c)`，fp32） | **不报错**。返回的整幅图覆盖一层规则网格 —— 512 px 看不出来，1200 px 非常明显 |
 
-`models/attention.py` 是唯一决定后端策略的地方：小规模的注意力固定走精确数学后端，VAE mid
-block 用同样的数学按 query 分块计算，因此整条链路都不会用到 ROCm 的融合内核。非 ROCm 设备仍然
-走 PyTorch 的正常分发，CUDA 输出不变。
+`models/attention.py` 是唯一决定后端策略的地方。**两个 fp16 站点会优先启用 SageAttention**，不
+可用时回落到精确数学路径；VAE mid block 用同样的精确数学按 query 分块计算。非 ROCm 设备仍然走
+PyTorch 的正常分发，CUDA 输出不变。
+
+注意：**融合 SDPA 后端在 ROCm 上不会被尝试，连回退都不算** —— 它们在这块卡上不保证抛异常
+（网格伪影就是融合内核静默返回错误数值），而异步失败会甩到后面某个无关的算子上，`try/except`
+兜不住。SageAttention 用不了时就直接走精确路径。VAE mid block 也接不了 Sage：它是
+`(1, 1, 22500, 512)` 的 fp32 单头注意力，内核要 131072 字节共享内存，硬件上限 65536。
+
+本机实测（780M / gfx1103，150px → 4×，`tile_size=512`，fp16，同种子）：精确路径 12.6 s，
+SageAttention **9.3 s**，相对精确路径最差像素 82/255、平均差 0.78/255。大约 1.2~1.35×，
+代价落在跟 bf16 同一量级，是取舍不是白捡。`VOSR2_ATTENTION=exact` 可以关掉。
 
 ### 2. 参考可复现性
 
