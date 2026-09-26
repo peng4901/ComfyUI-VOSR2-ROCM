@@ -28,10 +28,22 @@ images are missing or unsuitable, and they fail in two different ways:
 | LightningDiT and DINOv2 | Launches, then reports asynchronously at the next CUDA call — surfaces as `CUDA error: invalid argument` inside DINOv2's `proj` Linear |
 | VAE mid block (4-D `(b, 1, N, c)`, fp32) | Does not fail. Returns an image covered in a regular grid — invisible at 512 px, obvious at 1200 px |
 
-`models/attention.py` is the single place that decides backend policy. It pins the exact-math
-backend for the small attentions and computes the same math chunked over the query axis for the
-VAE mid block, so nothing in the pipeline uses a fused ROCm kernel. Non-ROCm devices keep
-PyTorch's normal dispatch, so CUDA output is unchanged.
+`models/attention.py` is the single place that decides backend policy. **The two fp16 sites prefer
+SageAttention** when it is installed and passes a one-off self-test, and fall back to the exact-math
+backend otherwise; the VAE mid block computes the same exact math chunked over the query axis.
+Non-ROCm devices keep PyTorch's normal dispatch, so CUDA output is unchanged.
+
+Note that the fused SDPA backends are **not** tried on ROCm, not even as a fallback: they do not
+reliably raise on this arch (the grid artifact was a fused kernel silently returning wrong numbers),
+and an async launch failure surfaces at some later, unrelated op, so `try/except` cannot contain it.
+When SageAttention is unavailable the code goes straight to the exact path. The VAE mid block cannot
+use Sage either — it is a `(1, 1, 22500, 512)` fp32 single-head call whose kernel asks for 131072
+bytes of shared memory against a 65536 limit.
+
+Measured on a 780M / gfx1103, 150 px → 4x, `tile_size=512`, fp16, same seed: exact path 12.6 s,
+SageAttention **9.3 s**, worst pixel 82/255 and mean 0.78/255 against the exact path. Roughly
+1.2–1.35x, at a cost in the same range that made bf16 unattractive. A trade, not a free win.
+`VOSR2_ATTENTION=exact` turns it off.
 
 ### 2. Reference reproducibility
 

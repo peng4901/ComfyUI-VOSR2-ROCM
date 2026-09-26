@@ -74,6 +74,50 @@ autocast). Deviation from an fp32 reference, matched policies, 128 px → 4x:
 `default` follows ComfyUI's device policy and is fp16 on this hardware. bf16 is an order of
 magnitude worse than fp16 here; a one-step model has no room to absorb that.
 
+## Acceleration: SageAttention on the two fp16 sites
+
+The exact-math path materialises the whole score matrix, which on this iGPU is the expensive way
+to do it. `models/attention.py` prefers an accelerated kernel when one is actually usable, and
+falls back otherwise:
+
+| Platform | Kernel |
+|---|---|
+| CUDA | torch's own SDPA dispatch (flash → mem-efficient → math). Unchanged |
+| ROCm | SageAttention, if installed and it passes a one-off self-test; else exact math |
+| VAE mid block | always the exact chunked path (Sage cannot take it — see below) |
+
+The fused SDPA backends are **not** tried on ROCm, not even as a fallback. They do not reliably
+raise on this arch: the grid artifact was a fused kernel returning wrong numbers with no error,
+and a failed async launch surfaces at whatever unrelated op runs next, so a probe wrapped in
+`try/except` cannot contain it.
+
+SageAttention cannot take the VAE mid block. That call is `(1, 1, 22500, 512)` fp32 single-head,
+which asks its kernel for 131072 bytes of shared memory against a hardware limit of 65536, so it
+stays on the exact chunked path.
+
+Measured on 780M / gfx1103, 150 px → 4x, `tile_size=512`, fp16, same seed:
+
+| Run | Time | vs exact path |
+|---|---|---|
+| exact math | 12.6 s | — |
+| exact math, second run (control) | 10.9 s | 0/255 — bit-identical |
+| SageAttention (now the default) | **9.3 s** | max 82/255, mean 0.78/255, 7.0% of pixels off by >2/255 |
+
+So it is roughly 1.2–1.35x on this stage, and the worst-pixel error lands in the same range that
+made bf16 unattractive above. A real trade, not a free win. `VOSR2_ATTENTION=exact` restores the
+previous behaviour everywhere.
+
+### Why there is a self-test
+
+A wrong-layout or wrong-API kernel can return plausible garbage without raising. Measured here:
+the installed `sageattn` takes NHD `(B, N, H, D)`, not the HND layout ComfyUI's own
+`attention_sage` uses. Feeding HND gave a cosine similarity of **0.008** against the correct
+answer and an end image that was a blocky mess — no exception, no warning. The self-test compares
+the kernel against the exact reference on the real shape, using independent random inputs (the
+caller's own `q = k = v`, which is common, makes attention diagonal-dominated and lets a wrong
+layout pass), and requires both cosine ≥ 0.99 and a relative magnitude error ≤ 5%. On failure the
+kernel is rejected for the rest of the process.
+
 ## Verifying a change
 
 The reference is the stock upstream `inference_vosr_onestep.py`, run fp32 on the same machine
